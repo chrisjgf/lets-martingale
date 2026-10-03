@@ -1,45 +1,103 @@
-from math import sqrt, floor
+"""Spread capital over a price ladder, bidding heavier towards the range end.
 
-# @var area                = total curve area 
-# @var x                   = max of x-axis range. ie. [0...5] => 5
-# @var y                   = initial c constant
-def curve_gradient(area, x_max, c):
-  # curve => (x/m) ** 2 + c = area
-  # integral => ((x ** 3) / (3 * (m ** 2))) + c = area
-  # rearranged for m
-  return sqrt((x_max ** 3) / ((area - (c * x_max)) * 3))
-  
-# @var x                  = x-axis range / num of intervals
-# @var c                  = initial constant / rough starting position
-# @var m                  = gradient of curve
-def curve(x, c, m):
-  return ((x ** 3) / (3 * (m ** 2))) + c
+Each tick n (0 at range start, N-1 at range end) gets a weight w(n). A fixed
+`base` share of the capital is split evenly across every tick, and the rest is
+split in proportion to the weights:
 
-# @var capital            = total capital to spend
-# @var price_range        = range of bid prices
-# @var step               = step to increment/decrement
-# @var initial_percentage = initial starting position
-def lets_martingale(capital, price_range, step, initial_percentage):
-  ab_step = abs(step)
-  direction = -1 if (price_range[1] - price_range[0]) < 0 else 1
-  directional_step = ab_step * direction
-  x_max = int(abs(price_range[1] - price_range[0]) / ab_step) + 1
-  c = initial_percentage * capital
-  m = curve_gradient(capital, x_max, c)
-  
-  print("==============")
-  print("Deploy {} over the range [{}, {}]".format(capital, price_range[0], price_range[1]))
-  print("==============")
+    bid(n) = base * capital / N  +  (1 - base) * capital * w(n) / sum(w)
 
-  
-  values = []
-  for i in range(0, x_max):
-    value = (curve(i+1, c, m) - curve(i, c, m)) + c
-    price = price_range[0] + (i * directional_step)
-    print("${}".format(price), "{0:.2f}".format(value), "{0:.2f}Ξ".format((value / price)))
-    values.append(value)
-  
-  print("==============")
-  print("Capital used:", sum(values))
+so the bids always add up to exactly `capital`, whatever N or w.
+"""
 
-lets_martingale(10000, [2000, 1000], 100, 0.03)
+import argparse
+from math import floor
+
+EPSILON = 1e-9
+
+
+# Weight functions: tick n -> relative weight. Only the shape matters; the
+# allocation normalises them.
+def linear(n, ticks):
+  return n + 1
+
+
+def power(exponent):
+  return lambda n, ticks: (n + 1) ** exponent
+
+
+def martingale(ratio):
+  # ratio ** n, written relative to the last tick so it never overflows
+  return lambda n, ticks: ratio ** (n - (ticks - 1))
+
+
+WEIGHTS = {
+  "linear": lambda arg: linear,
+  "power": lambda arg: power(2.0 if arg is None else arg),
+  "martingale": lambda arg: martingale(2.0 if arg is None else arg),
+}
+
+
+def price_ladder(start, end, step):
+  if step <= 0:
+    raise ValueError("step must be positive")
+  span = abs(end - start)
+  direction = -1 if end < start else 1
+  # The epsilon stops float error (0.2 / 0.1 = 1.9999...) dropping the last tick
+  ticks = floor(span / step + EPSILON) + 1
+  return [round(start + direction * n * step, 10) for n in range(ticks)]
+
+
+def allocate(capital, ticks, weight, base):
+  if capital <= 0:
+    raise ValueError("capital must be positive")
+  if not 0 <= base <= 1:
+    raise ValueError("base must be between 0 and 1")
+  weights = [weight(n, ticks) for n in range(ticks)]
+  if any(w < 0 for w in weights) or sum(weights) <= 0:
+    raise ValueError("weights must be non-negative with a positive sum")
+  floor_bid = base * capital / ticks
+  weighted = (1 - base) * capital
+  return [floor_bid + weighted * w / sum(weights) for w in weights]
+
+
+def lets_martingale(capital, start, end, step, weight, base):
+  prices = price_ladder(start, end, step)
+  bids = allocate(capital, len(prices), weight, base)
+  return list(zip(prices, bids))
+
+
+def report(capital, start, end, rows):
+  coins = sum(bid / price for price, bid in rows)
+  lines = [
+    "==============",
+    "Deploy ${:,.2f} over the range [{:g}, {:g}]".format(capital, start, end),
+    "==============",
+    *("${:<10g} {:>10.2f} {:>8.4f}Ξ".format(p, b, b / p) for p, b in rows),
+    "==============",
+    "Capital used: {:.2f}".format(sum(bid for _, bid in rows)),
+    "Average entry if fully filled: ${:.2f} ({:.4f}Ξ)".format(capital / coins, coins),
+  ]
+  return "\n".join(lines)
+
+
+def main():
+  parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+  parser.add_argument("--capital", type=float, default=10000)
+  parser.add_argument("--start", type=float, default=2000, help="first bid price")
+  parser.add_argument("--end", type=float, default=1000, help="range-end bid price")
+  parser.add_argument("--step", type=float, default=100)
+  parser.add_argument("--weight", choices=WEIGHTS, default="power")
+  parser.add_argument(
+    "--arg", type=float, help="power exponent (default 2) or martingale ratio (default 2)"
+  )
+  parser.add_argument(
+    "--base", type=float, default=0.3, help="share of capital spread evenly (0-1)"
+  )
+  args = parser.parse_args()
+  weight = WEIGHTS[args.weight](args.arg)
+  rows = lets_martingale(args.capital, args.start, args.end, args.step, weight, args.base)
+  print(report(args.capital, args.start, args.end, rows))
+
+
+if __name__ == "__main__":
+  main()
